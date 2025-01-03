@@ -84,6 +84,16 @@ def on_mouse_wheel(event):
     # Adjust the image size and position accordingly
     update_image_position()
 
+# Precompute mapping
+def precompute_cube_order(size):
+    default_map = np.zeros((size, size, size), dtype=np.int32)
+    for x in range(size):
+        for y in range(size):
+            for z in range(size):
+                index = x * size**2 + y * size + z
+                default_map[x, y, z] = index
+    return default_map
+
 # Precompute Z-curve mapping
 def precompute_z_curve(size):
     bits = size.bit_length() - 1
@@ -147,13 +157,116 @@ def precompute_swizzle_offsets(size):
 
     return swizzle_map
 
-# Load the color cube .rgb file
-def load_rgb_cube(filename, size):
-    num_coords = size ** 3
-    with open(filename, 'rb') as f:
-        data = np.frombuffer(f.read(), dtype=np.uint8)
+def load_cube(filename):
+    global platform
+    with open(filename, 'r') as f:
+        lines = f.readlines()
     
-    color_cube = data.reshape((num_coords, 3))  # Shape (num_coords, 3), each entry is [B, G, R]
+    size = None
+    data_points = []
+
+    # Read the header and LUT data points
+    for line in lines:
+        # Remove comments and leading/trailing whitespaces
+        line = line.split('#')[0].strip()
+        
+        if not line:
+            continue  # Skip empty lines
+        
+        if line.startswith('LUT_3D_SIZE'):
+            # Extract the LUT size
+            size = int(line.split()[1])
+        elif not any(keyword in line for keyword in ('DOMAIN_MIN', 'DOMAIN_MAX', 'TITLE')):
+            # Assume the line contains LUT data points if it's not a known keyword
+            data_points.append([float(x) for x in line.split()])
+    
+    if size is None:
+        raise ValueError("LUT size (LUT_3D_SIZE) not found in the .cube file.")
+    
+    # Convert data points to a NumPy array and scale to [0, 255]
+    data = np.array(data_points, dtype=np.float32)
+    data = np.clip(data, 0.0, 1.0)  # Ensure values are within [0.0, 1.0]
+    data = (data * 255).astype(np.uint8)  # Scale and convert to uint8
+
+    # Validate the data length
+    expected_points = size ** 3
+    if len(data) != expected_points:
+        raise ValueError(f"Expected {expected_points} data points, but got {len(data)}.")
+    
+    # If the LUT size is not 32x32x32, resample the data to fit the new size
+    if size != 32:
+        # Calculate the new number of points for 32x32x32
+        new_size = 32
+        new_expected_points = new_size ** 3
+        
+        # Reshape the data to a cube of size (size, size, size, 3)
+        data = data.reshape((size, size, size, 3))
+        
+        # Create an empty array for the resized LUT
+        resized_data = np.zeros((new_size, new_size, new_size, 3), dtype=np.uint8)
+
+        # Simple resizing by averaging nearby values
+        for x in range(new_size):
+            for y in range(new_size):
+                for z in range(new_size):
+                    # Find corresponding coordinates in the original LUT data
+                    original_x = int(x * (size / new_size))
+                    original_y = int(y * (size / new_size))
+                    original_z = int(z * (size / new_size))
+                    
+                    # Assign the color value from the original LUT
+                    resized_data[x, y, z] = data[original_x, original_y, original_z]
+        
+        # Flatten the resized LUT back to a 1D array
+        data = resized_data.reshape((new_expected_points, 3))
+        expected_points = new_expected_points  # Update expected points to match 32x32x32
+
+    # Reshape LUT data to match the expected LUT format
+    color_cube = np.zeros((expected_points, 3), dtype=np.uint8)
+    color_cube = data  # Shape (num_coords, 3), each entry is [R, G, B]
+    dest = np.zeros_like(color_cube)
+
+    # Assuming cube_map, z_curve_map, and swizzle_map are defined elsewhere
+    indices_c = cube_map.flatten()  
+    indices_z = z_curve_map.flatten()  
+    indices_s = swizzle_map.flatten()  
+
+    if platform == 'PS3':
+        # Apply the Z-curve mapping for PS3 platform
+        dest[indices_z] = color_cube[indices_c]
+    elif platform == 'Xbox':
+        # Apply the Swizzle mapping for Xbox platform
+        dest[indices_s] = color_cube[indices_c]
+    else:
+        raise ValueError("Unsupported platform. Please choose 'PS3' or 'Xbox'.")
+
+    return dest
+
+def swap_target_lut_platform(target_lut, platform):
+    global z_curve_map, swizzle_map
+    dest = np.zeros_like(target_lut)
+    indices_z = z_curve_map.flatten()
+    indices_s = swizzle_map.flatten()
+    if platform == 'PS3':
+        dest[indices_z] = target_lut[indices_s]
+        return dest
+    elif platform == 'Xbox':
+        dest[indices_s] = target_lut[indices_z]
+        return dest
+    else:
+        raise ValueError("Unsupported platform. Please choose 'PS3' or 'Xbox'.")
+
+# Load the color cube .rgb file
+def load_rgb_cube(filename):
+    size = 32
+    if os.path.splitext(filename)[1].lower() == '.cube':
+        color_cube = load_cube(filename)
+    else:
+        with open(filename, 'rb') as f:
+            color_cube = np.frombuffer(f.read(), dtype=np.uint8)
+            num_coords = size ** 3
+            color_cube = color_cube.reshape((num_coords, 3))  # Shape (num_coords, 3), each entry is [B, G, R]
+    
     color_cube = color_cube[:, [2, 1, 0]]
     return color_cube
 
@@ -428,7 +541,7 @@ def show_image(image):
     canvas.config(scrollregion=canvas.bbox('all'))
 
 def open_lut_file():
-    file_path = filedialog.askopenfilename(title="Select an .rgb File", filetypes=[("RGB Files", "*.rgb")])
+    file_path = filedialog.askopenfilename(title="Select an .rgb or .cube file", filetypes=[("CLUT Files", "*.rgb *.cube")])
     return file_path if os.path.exists(file_path) else None
 
 # Function to divide the image into chunks
@@ -461,7 +574,7 @@ def load_colourcube():
     if not target_file:
         print("No target LUT selected.")
         return
-    target_lut = load_rgb_cube(target_file, size=32)  # Adjust size as needed
+    target_lut = load_rgb_cube(target_file)
     if image:
         # Divide the image into chunks and process them in parallel
         chunks = divide_image_into_chunks(original_image, chunk_size=100)
@@ -513,13 +626,14 @@ def reset_sliders():
 
 # GUI components
 def run_app():
-    global image, original_image, target_lut, transformed_image, blended_image, z_curve_map, swizzle_map
+    global image, original_image, target_lut, transformed_image, blended_image, z_curve_map, swizzle_map, cube_map
     global strength_slider, contrast_slider, brightness_slider, hue_slider, debounced_apply_transformation
     transformed_image = None
     blended_image = None
     image = None
     target_lut = None
 
+    cube_map = precompute_cube_order(size=32)  # Precompute cube indices 
     z_curve_map = precompute_z_curve(size=32)  # Precompute Z-curve indices
     swizzle_map = precompute_swizzle_offsets(size=32)  # Precompute swizzle indices
 
@@ -549,7 +663,7 @@ def run_app():
 
     # Add buttons and sliders to the controls frame
     Button(controls_frame, text="Open Image", command=open_image).pack(side='left', padx=5, pady=5)
-    Button(controls_frame, text="Load Skate cc *.rgb", command=load_colourcube).pack(side='left', padx=5, pady=5)
+    Button(controls_frame, text="Load Skate cc *.rgb or LUT *.cube", command=load_colourcube).pack(side='left', padx=5, pady=5)
     Button(controls_frame, text="Save Image", command=save_image).pack(side='left', padx=5, pady=5)
 
     Button(controls_frame, text="Save Skate cc *.rgb", command=save_rgb).pack(side='right', padx=5, pady=5)
