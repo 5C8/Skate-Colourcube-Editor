@@ -4,7 +4,6 @@ from PIL import Image, ImageTk
 import os
 from concurrent.futures import ThreadPoolExecutor
 import threading
-import ctypes
 import time
 
 # Debounce implementation
@@ -28,6 +27,7 @@ def apply_transformation_debounced(*args):
     if debounced_apply_transformation:
         debounced_apply_transformation.call()
 
+current_image_tk = None
 last_loaded_lut = None
 current_lut_file_path = None
 lut_files = []
@@ -36,7 +36,7 @@ current_lut_index = -1
 current_image_index = -1
 
 platform = 'PS3'
-platform_swap = False
+lut_reload = False
 zoom_level = 1.0  # Start with a default zoom level
 x_offset = 0  # Initial horizontal offset
 y_offset = 0  # Initial vertical offset
@@ -48,7 +48,7 @@ num_coords = size ** 3
 
 def load_lut_files_from_directory(directory):
     global lut_files, current_lut_index
-    lut_files = [os.path.join(directory, f) for f in os.listdir(directory) if f.endswith(('.rgb', '.cube'))]
+    lut_files = [os.path.join(directory, f) for f in os.listdir(directory) if f.lower().endswith(('.rgb', '.cube'))]
     if lut_files:
         if current_lut_file_path in lut_files:
             current_lut_index = lut_files.index(current_lut_file_path)
@@ -61,7 +61,7 @@ def load_lut_files_from_directory(directory):
 
 def load_image_files_from_directory(directory):
     global image_files, current_image_index
-    image_files = [os.path.join(directory, f) for f in os.listdir(directory) if f.endswith(('.png', '.jpg', '.jpeg'))]
+    image_files = [os.path.join(directory, f) for f in os.listdir(directory) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     if image_files:
         if current_lut_file_path in image_files:
             current_image_index = image_files.index(current_lut_file_path)
@@ -194,35 +194,49 @@ def precompute_swizzle_offsets(size):
 
     return swizzle_map
 
-def load_cube(filename):
-    global platform
+def parse_cube_file(file_path):
+    data_points = []
+    size = None
+    parsing_data = False  # Flag to track when to start parsing data points
     
-    # Read the file and extract the LUT size and data points in a single pass
-    with open(filename, 'r') as f:
-        lines = f.readlines()
+    with open(file_path, 'r') as file:
+        for line in file:   
+            if not parsing_data:
+                line = line.split('#', 1)[0].strip()  # Remove comments and leading/trailing whitespaces
+                if not line:  # Skip empty lines
+                    continue
+                # Process LUT_3D_SIZE to extract the size
+                if line.startswith('LUT_3D_SIZE'):
+                    size = int(line.split()[1])
+                    continue  # Skip processing this line for data
+                
+                # Skip lines that contain 'DOMAIN_MIN', 'DOMAIN_MAX', 'TITLE', etc.
+                if 'DOMAIN_MIN' in line or 'DOMAIN_MAX' in line or 'TITLE' in line:
+                    continue
+                
+                # The first valid data line is encountered, start parsing data points
+                parsing_data = True
+                data_points.append(tuple(map(float, line.split())))
+            else:
+                data_points.append(tuple(map(float, line.split())))
+    
+    return size, data_points
+
+
+def load_cube(file_path):
+    global platform
     
     # Initialize variables
     size = None
     data_points = []
     
-    # Efficiently parse the file
-    for line in lines:
-        line = line.split('#')[0].strip()  # Remove comments and extra spaces
-        if not line:
-            continue
-        
-        if line.startswith('LUT_3D_SIZE'):
-            size = int(line.split()[1])
-        elif 'DOMAIN_MIN' not in line and 'DOMAIN_MAX' not in line and 'TITLE' not in line:
-            data_points.append([float(x) for x in line.split()])
-    
+    size, data_points = parse_cube_file(file_path)
+
     if size is None:
         raise ValueError("LUT size (LUT_3D_SIZE) not found in the .cube file.")
     
     # Convert data points to a NumPy array and scale to [0, 255]
-    data = np.array(data_points, dtype=np.float32)
-    data = np.clip(data, 0.0, 1.0)  # Ensure values are within [0.0, 1.0]
-    data = (data * 255).astype(np.uint8)  # Scale and convert to uint8
+    data = (np.array(data_points, dtype=np.float32) * 255).astype(np.uint8)
 
     # Validate the data length
     expected_points = size ** 3
@@ -267,7 +281,6 @@ def load_cube(filename):
         dest[indices_s] = color_cube[indices_c]
     else:
         raise ValueError("Unsupported platform. Please choose 'PS3' or 'Xbox'.")
-    
     return dest
 
 def save_cube(filename, color_cube, size=32):
@@ -326,7 +339,7 @@ def swap_target_lut_platform(target_lut, platform):
 
 # Load the color cube .rgb file
 def load_rgb_cube(filename):
-    global target_lut, current_lut_file_path, transformed_image, blended_image, z_curve_map
+    global target_lut, current_lut_file_path, blended_image, z_curve_map
     current_lut_file_path = filename
     if os.path.splitext(filename)[1].lower() == '.cube':
         color_cube = load_cube(filename)
@@ -338,11 +351,17 @@ def load_rgb_cube(filename):
     
     color_cube = color_cube[:, [2, 1, 0]]
     target_lut = color_cube
+    apply_transformation()
 
-    if image:
-        transformed_image = map_image_to_color_cube(original_image, target_lut, 32, platform, z_curve_map, swizzle_map)
-        # Apply changes and show the image
-        apply_transformation()
+# Load neutral color cube
+def load_neutral_cube():
+    global target_lut, current_lut_file_path, blended_image, z_curve_map, lut_reload, last_loaded_lut
+    og_lut = create_og_lut()
+    update_rgb_label('neutral')
+    last_loaded_lut = 'neutral'
+    target_lut = og_lut[:, [2, 1, 0]]
+    lut_reload = True
+    apply_transformation()
 
 def map_image_to_color_cube(img_data, target_color_cube, size, platform, z_curve_map, swizzle_map, num_threads=4):
     # Precompute scale factor
@@ -590,7 +609,7 @@ def save_rgb():
 
 # Apply transformation in a separate thread for higher performance
 def apply_transformation(*args):
-    global transformed_image, blended_image, last_loaded_lut, platform_swap
+    global transformed_image, blended_image, last_loaded_lut, lut_reload
     if image is None or target_lut is None:
         return
     
@@ -601,12 +620,16 @@ def apply_transformation(*args):
     if (
         last_loaded_lut != current_lut_file_path or 
         transformed_image is None or 
-        platform_swap
+        lut_reload
     ):
-        platform_swap = False
+        lut_reload = False
         print("Mapping image with the current LUT...")
         # Divide the image into chunks and process them in parallel
-        transformed_image = map_image_to_color_cube(original_image, target_lut, 32, platform, z_curve_map, swizzle_map)
+        if last_loaded_lut == 'neutral':
+            transformed_image = original_image
+        else:
+            transformed_image = map_image_to_color_cube(original_image, target_lut, 32, platform, z_curve_map, swizzle_map)
+        last_loaded_lut = current_lut_file_path
 
     # Get the current slider values
     contrast_factor = contrast_slider.get()
@@ -629,13 +652,26 @@ def apply_transformation(*args):
     show_image(Image.fromarray(blended_image))
 
 def load_image(file_path):
-    global original_image, image, transformed_image, blended_image
+    global original_image, image, transformed_image, blended_image, zoom_level
     image = Image.open(file_path).convert("RGB")
     update_image_label(file_path)
     original_image = np.array(image)  # Keep the original image as a NumPy array for transformation
+
+    canvas_width = canvas.winfo_width()
+    canvas_height = canvas.winfo_height()
+    img_width, img_height = image.size
+    scale_x = canvas_width / img_width
+    scale_y = canvas_height / img_height
+
+    # Choose the smaller scale factor to fit the image inside the canvas
+    zoom_level = min(scale_x, scale_y)
+
     if blended_image is None:
         show_image(image)
     transformed_image = None
+    if target_lut is None:
+        load_neutral_cube()
+        return
     apply_transformation()
     
 
@@ -649,14 +685,16 @@ def open_image():
         load_image(file_path)
 
 def show_image(image):
+    global current_image_tk
+    
     if image is None:
         return
-    
+
     # Ensure image is a PIL Image
     if isinstance(image, np.ndarray):
         image = Image.fromarray(image)
 
-    # Scale the image based on the current zoom level
+    # Scale the image based on the current zoom level only if necessary
     img_resized = image.resize(
         (int(image.width * zoom_level), int(image.height * zoom_level)),
         Image.Resampling.LANCZOS
@@ -665,9 +703,14 @@ def show_image(image):
     # Convert to Tkinter format
     img_tk = ImageTk.PhotoImage(img_resized)
 
-    # Update canvas with the resized image and applied offsets
-    canvas.create_image(x_offset, y_offset, anchor='nw', image=img_tk)
-    canvas.image = img_tk
+    # Reuse the previous image if it has not changed
+    if current_image_tk != img_tk:
+        # Update the canvas with the resized image and applied offsets
+        canvas.create_image(x_offset, y_offset, anchor='center', image=img_tk)
+        canvas.image = img_tk
+        current_image_tk = img_tk  # Keep track of the current image
+
+    # Update the scroll region
     canvas.config(scrollregion=canvas.bbox('all'))
 
 def open_lut_file():
@@ -757,23 +800,7 @@ current_thread = None  # Track the current thread
 active_threads = []  # Track active threads for additional monitoring
 last_execution_time = 0  # Timestamp of the last function execution
 
-def terminate_thread(thread):
-    """Forcefully terminate a thread."""
-    if not thread.is_alive():
-        return
-    thread_id = ctypes.c_long(thread.ident)
-    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
-        thread_id, ctypes.py_object(SystemExit)
-    )
-    if res == 0:
-        raise ValueError("Invalid thread ID")
-    elif res > 1:
-        # Reset to prevent affecting other threads
-        ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, None)
-        raise SystemError("PyThreadState_SetAsyncExc failed")
-
 def debounce(func):
-    """Decorator to add debounce functionality to a function."""
     def wrapper(*args, **kwargs):
         global last_execution_time
         current_time = time.time()
@@ -783,13 +810,11 @@ def debounce(func):
     return wrapper
 
 def is_thread_active():
-    """Check if the current thread is still running."""
     global current_thread
     return current_thread is not None and current_thread.is_alive()
 
 @debounce
 def on_left_arrow(event):
-    """Handle left arrow key press to cycle to the previous .rgb or .cube file."""
     global current_lut_index, current_thread, active_threads
     if lut_files:
         # Update to the previous file
@@ -807,7 +832,6 @@ def on_left_arrow(event):
 
 @debounce
 def on_right_arrow(event):
-    """Handle right arrow key press to cycle to the next .rgb or .cube file."""
     global current_lut_index, current_thread, active_threads
     if lut_files:
 
@@ -826,7 +850,6 @@ def on_right_arrow(event):
 
 @debounce
 def on_up_arrow(event):
-    """Handle left arrow key press to cycle to the previous .rgb or .cube file."""
     global current_image_index, current_thread, active_threads
     if image_files:
         # Update to the previous file
@@ -844,7 +867,6 @@ def on_up_arrow(event):
 
 @debounce
 def on_down_arrow(event):
-    """Handle right arrow key press to cycle to the next .rgb or .cube file."""
     global current_image_index, current_thread, active_threads
     if image_files:
         # Update to the next file
@@ -890,13 +912,21 @@ def run_app():
     label_frame.grid(row=0, column=0, sticky="w", padx=10, pady=5)  # Add padding at the top and left
 
     # Create the labels for displaying the file names
+    image_l1 = Label(label_frame, text="[", font=("Arial", 12), fg="black")
+    image_l1.grid(row=0, column=0, sticky="w")
     global image_label
-    image_label = Label(label_frame, text="", font=("Arial", 12), fg="black")
-    image_label.grid(row=0, column=0, sticky="w")
+    image_label = Label(label_frame, text="-", font=("Arial", 12), fg="green")
+    image_label.grid(row=0, column=1, sticky="w")
+    image_l2 = Label(label_frame, text="]", font=("Arial", 12), fg="black")
+    image_l2.grid(row=0, column=2, sticky="w")
 
+    rgb_l1 = Label(label_frame, text="[", font=("Arial", 12), fg="black")
+    rgb_l1.grid(row=0, column=3, sticky="w")
     global rgb_label
-    rgb_label = Label(label_frame, text="", font=("Arial", 12), fg="blue")
-    rgb_label.grid(row=0, column=1, sticky="w")  # Place label at top-left of the label_frame
+    rgb_label = Label(label_frame, text="-", font=("Arial", 12), fg="blue")
+    rgb_label.grid(row=0, column=4, sticky="w")  # Place label at top-left of the label_frame
+    rgb_l2 = Label(label_frame, text="]", font=("Arial", 12), fg="black")
+    rgb_l2.grid(row=0, column=5, sticky="w")
 
     # Create canvas for image display
     global canvas
@@ -922,10 +952,11 @@ def run_app():
 
     # Add buttons and sliders to the controls frame
     Button(controls_frame, text="Open Image", command=open_image).pack(side='left', padx=5, pady=5)
-    Button(controls_frame, text="Load CLUT *.rgb or *.cube", command=load_colourcube).pack(side='left', padx=5, pady=5)
+    Button(controls_frame, text="Load LUT", command=load_colourcube).pack(side='left', padx=5, pady=5)
+    Button(controls_frame, text="Neutral LUT", command=load_neutral_cube).pack(side='left', padx=5, pady=5)
     Button(controls_frame, text="Save Image", command=save_image).pack(side='left', padx=5, pady=5)
 
-    Button(controls_frame, text="Save CLUT *.rgb or *.cube", command=save_rgb).pack(side='right', padx=5, pady=5)
+    Button(controls_frame, text="Save LUT", command=save_rgb).pack(side='right', padx=5, pady=5)
     Button(controls_frame, text="↺", command=reset_sliders).pack(side='right', padx=5, pady=5)
 
     # Add platform switch dropdown
