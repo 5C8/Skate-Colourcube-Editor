@@ -355,10 +355,10 @@ def load_rgb_cube(filename):
 
 # Load neutral color cube
 def load_neutral_cube():
-    global target_lut, current_lut_file_path, blended_image, z_curve_map, lut_reload, last_loaded_lut
+    global target_lut, current_lut_file_path, blended_image, z_curve_map, lut_reload, current_lut_file_path
     og_lut = create_og_lut()
     update_rgb_label('neutral')
-    last_loaded_lut = 'neutral'
+    current_lut_file_path = 'neutral'
     target_lut = og_lut[:, [2, 1, 0]]
     lut_reload = True
     apply_transformation()
@@ -623,11 +623,11 @@ def apply_transformation(*args):
         lut_reload
     ):
         lut_reload = False
-        print("Mapping image with the current LUT...")
         # Divide the image into chunks and process them in parallel
-        if last_loaded_lut == 'neutral':
+        if current_lut_file_path == 'neutral':
             transformed_image = original_image
         else:
+            print("Mapping image with the current LUT...")
             transformed_image = map_image_to_color_cube(original_image, target_lut, 32, platform, z_curve_map, swizzle_map)
         last_loaded_lut = current_lut_file_path
 
