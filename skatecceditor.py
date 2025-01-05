@@ -3,6 +3,7 @@ from tkinter import Tk, filedialog, Button, Canvas, Scale, OptionMenu, StringVar
 from PIL import Image, ImageTk
 import os
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import threading
 import time
 
@@ -281,6 +282,8 @@ def load_cube(file_path):
         dest[indices_s] = color_cube[indices_c]
     else:
         raise ValueError("Unsupported platform. Please choose 'PS3' or 'Xbox'.")
+    
+    dest = dest[:, [0, 1, 2]]
     return dest
 
 def save_cube(filename, color_cube, size=32):
@@ -349,7 +352,6 @@ def load_rgb_cube(filename):
             num_coords = size ** 3
             color_cube = color_cube.reshape((num_coords, 3))  # Shape (num_coords, 3), each entry is [B, G, R]
     
-    color_cube = color_cube[:, [2, 1, 0]]
     target_lut = color_cube
     apply_transformation()
 
@@ -392,7 +394,7 @@ def map_image_to_color_cube(img_data, target_color_cube, size, platform, z_curve
     def process_chunk(start, end):
         chunk = img_data[start:end]
         coords = chunk * scale_factor
-        x, y, z = coords[:, :, 0], coords[:, :, 1], coords[:, :, 2]
+        z, y, x = coords[:, :, 0], coords[:, :, 1], coords[:, :, 2]
 
         x0, y0, z0 = np.floor(x).astype(int), np.floor(y).astype(int), np.floor(z).astype(int)
         x1, y1, z1 = np.clip(x0 + 1, 0, size - 1), np.clip(y0 + 1, 0, size - 1), np.clip(z0 + 1, 0, size - 1)
@@ -442,6 +444,45 @@ def map_image_to_color_cube(img_data, target_color_cube, size, platform, z_curve
     # Convert result back to uint8 (simulating the final step)
     return np.clip(result.astype(np.uint8), 0, 255)
 
+# Function to blend a chunk of the image
+def blend_chunk(original_chunk, transformed_chunk, alpha):
+    return (original_chunk * (1 - alpha) + transformed_chunk * alpha)
+
+# Main function to blend images with multithreading
+def blend_images(original, transformed, strength_factor, num_workers=12):
+    height = original.shape[0]
+    chunk_size = height // num_workers
+    remainder = height % num_workers
+    
+    # If strength_factor is 0, return the original image
+    if strength_factor == 0:
+        return original
+    
+    # Calculate the alpha based on the strength_factor
+    if strength_factor <= 100:
+        alpha = strength_factor / 100.0
+    else:
+        alpha = min(strength_factor / 100.0, 2.0)  # Limit alpha to a maximum of 2
+
+    # Divide the images into chunks
+    chunks_original = [original[i * chunk_size:(i + 1) * chunk_size] for i in range(num_workers)]
+    chunks_transformed = [transformed[i * chunk_size:(i + 1) * chunk_size] for i in range(num_workers)]
+
+    # Handle the remainder for the last chunk
+    if remainder > 0:
+        chunks_original[-1] = original[-remainder:]
+        chunks_transformed[-1] = transformed[-remainder:]
+
+    # Use ThreadPoolExecutor to process chunks concurrently
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        blended_chunks = list(executor.map(blend_chunk, chunks_original, chunks_transformed, [alpha] * num_workers))
+
+    # Reconstruct the blended image by combining all the chunks
+    blended = np.vstack(blended_chunks)
+
+    # Ensure the result is within the valid range [0, 255]
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
 # Blend the original and transformed images based on the strength factor
 def blend_images(original, transformed, strength_factor):
     if strength_factor == 0:
@@ -458,34 +499,122 @@ def blend_images(original, transformed, strength_factor):
     # Ensure the result is within the valid range [0, 255]
     return np.clip(blended, 0, 255).astype(np.uint8)
 
-def adjust_image(image_data, contrast_factor, brightness_factor, hue_factor):
-    # Apply contrast: scale pixel values relative to the mean of the image
+def adjust_saturation_chunk(chunk, saturation_factor):
+    if saturation_factor == 0:
+        return chunk
+
+    # Normalize the image data to [0, 1]
+    chunk = chunk / 255.0
+    R, G, B = chunk[..., 0], chunk[..., 1], chunk[..., 2]
+
+    # Calculate max, min, delta, and lightness
+    max_val = np.max(chunk, axis=-1)
+    min_val = np.min(chunk, axis=-1)
+    delta = max_val - min_val
+    L = (max_val + min_val) / 2
+
+    # Adjust saturation using a vectorized approach
+    epsilon = 1e-10
+    S = np.where(L < 0.5, delta / (max_val + min_val + epsilon), delta / (2 - max_val - min_val + epsilon))
+    S = np.nan_to_num(S)  # Avoid NaNs from division by zero
+    S = np.clip(S * (saturation_factor / 100 + 1), 0, 1)
+
+    # Precompute constants
+    one_sixth = 1 / 6
+    two_thirds = 2 / 3
+
+    # Calculate Q and P for hue adjustment
+    Q = np.where(L < 0.5, L * (1 + S), L + S - L * S)
+    P = 2 * L - Q
+
+    # Vectorized hue calculations
+    H = np.zeros_like(R)
+    idx = delta > 0
+    delta = np.where(delta == 0, epsilon, delta)  # Avoid division by zero in hue calculation
+    H[idx & (max_val == R)] = (G - B)[idx & (max_val == R)] / delta[idx & (max_val == R)]
+    H[idx & (max_val == G)] = 2 + (B - R)[idx & (max_val == G)] / delta[idx & (max_val == G)]
+    H[idx & (max_val == B)] = 4 + (R - G)[idx & (max_val == B)] / delta[idx & (max_val == B)]
+    H /= 6
+    H = np.where(H < 0, H + 1, H)
+
+    # Vectorized _hue_to_rgb function
+    def _hue_to_rgb(p, q, t):
+        t = np.where(t < 0, t + 1, t)
+        t = np.where(t > 1, t - 1, t)
+        return np.where(t < one_sixth, p + (q - p) * 6 * t,
+               np.where(t < 0.5, q, 
+               np.where(t < two_thirds, p + (q - p) * (two_thirds - t) * 6, p)))
+
+    R = _hue_to_rgb(P, Q, H + one_sixth)
+    G = _hue_to_rgb(P, Q, H)
+    B = _hue_to_rgb(P, Q, H - one_sixth)
+
+    # Reconstruct and scale the image back to [0, 255]
+    chunk = np.stack([R, G, B], axis=-1) * 255
+    return np.clip(chunk, 0, 255).astype(np.uint8)
+
+def adjust_saturation(image_data, saturation_factor, num_workers=12):
+    height = image_data.shape[0]
+    
+    # Calculate the chunk size and the remainder
+    chunk_size = height // num_workers
+    remainder = height % num_workers
+
+    # Slice image_data into chunks, with the last chunk taking the remainder
+    chunks = [image_data[i * chunk_size:(i + 1) * chunk_size] for i in range(num_workers)]
+    
+    # Handle the remainder by adding it to the last chunk
+    if remainder > 0:
+        chunks[-1] = np.vstack([chunks[-1], image_data[-remainder:]])
+
+    # Process the chunks using ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        processed_chunks = list(executor.map(adjust_saturation_chunk, chunks, [saturation_factor] * num_workers))
+
+    return np.vstack(processed_chunks)
+
+saturated_image = None
+desaturated_image = None
+previous_image_hash = None
+
+def hash_image(image_data):
+    """Generate a hash for the given image data."""
+    return hashlib.sha256(image_data.tobytes()).hexdigest()
+
+def adjust_image(image_data, saturation_factor, contrast_factor, brightness_factor, hue_factor):
+    global saturated_image, desaturated_image, previous_image_hash
+    
+    current_image_hash = hash_image(image_data)
+    if previous_image_hash != current_image_hash:
+        # Image data has changed, recalculate saturated and desaturated images
+        saturated_image = adjust_saturation(image_data, 200)
+        desaturated_image = adjust_saturation(image_data, -100)
+        previous_image_hash = current_image_hash
+
+    if saturation_factor != 0:
+        if saturation_factor > 0:
+            image_data = blend_images(image_data, saturated_image, saturation_factor)
+        else:
+            image_data = blend_images(image_data, desaturated_image, -saturation_factor)
+
+    # Apply contrast adjustment
     mean = np.mean(image_data, axis=(0, 1), keepdims=True)
     image_data = (image_data - mean) * (contrast_factor / 100 + 1) + mean
 
-    # Apply brightness: add a constant to each pixel's RGB values
+    # Apply brightness adjustment
     image_data += brightness_factor
 
     # Apply hue adjustment
-    # Convert hue factor to radians for rotation
     hue_angle = hue_factor * (np.pi / 180)
     cos_hue = np.cos(hue_angle)
     sin_hue = np.sin(hue_angle)
-
-    # Rotation matrix for hue adjustment
-    # This rotates the RGB channels in a way that preserves the overall luminance
     rotation_matrix = np.array([
         [cos_hue + (1.0 - cos_hue) / 3, (1.0 - cos_hue) / 3 - sin_hue / np.sqrt(3), (1.0 - cos_hue) / 3 + sin_hue / np.sqrt(3)],
         [(1.0 - cos_hue) / 3 + sin_hue / np.sqrt(3), cos_hue + (1.0 - cos_hue) / 3, (1.0 - cos_hue) / 3 - sin_hue / np.sqrt(3)],
         [(1.0 - cos_hue) / 3 - sin_hue / np.sqrt(3), (1.0 - cos_hue) / 3 + sin_hue / np.sqrt(3), cos_hue + (1.0 - cos_hue) / 3]
     ])
-
-    # Apply the rotation matrix to each pixel's RGB values
     image_data = np.dot(image_data, rotation_matrix.T)
-
-    # Clip values to ensure they are valid RGB (between 0 and 255)
     return np.clip(image_data, 0, 255).astype(np.uint8)
-
 
 # Save the mapped image to a new file
 def save_image():
@@ -499,14 +628,15 @@ def save_image():
         return
 
     # Get the current slider values
+    saturation_factor = saturation_slider.get()
     contrast_factor = contrast_slider.get()
     brightness_factor = brightness_slider.get()
     hue_factor = hue_slider.get()
     strength_factor = strength_slider.get()
 
     # Apply adjustments and blend the original and transformed images
-    if contrast_factor != 0 or brightness_factor != 0 or hue_factor != 0:
-        adjusted_image = adjust_image(transformed_image, contrast_factor, brightness_factor, hue_factor)
+    if saturation_factor != 0 or contrast_factor != 0 or brightness_factor != 0 or hue_factor != 0:
+        adjusted_image = adjust_image(transformed_image, saturation_factor, contrast_factor, brightness_factor, hue_factor)
     else:
         adjusted_image = transformed_image
     
@@ -553,7 +683,7 @@ def create_og_lut():
                 index = precomputed_map[x, y, z]
 
                 # Store the color in the array (RGB values)
-                data[index * 3:(index + 1) * 3] = [color[2], color[1], color[0]]  # Convert RGB to BGR format for storage
+                data[index * 3:(index + 1) * 3] = [color[0], color[1], color[2]]  # Convert RGB to BGR format for storage
 
     return np.array(data).reshape((num_coords, 3))  # Reshape to (num_coords, 3)
 
@@ -573,27 +703,25 @@ def save_rgb():
 
     if target_lut is None:
         print("No LUT loaded.")
-        target_lut = og_lut[:, [2, 1, 0]]
+        target_lut = og_lut
 
     if not filename:
         return
 
     # Get the current slider values
+    saturation_factor = saturation_slider.get()
     contrast_factor = contrast_slider.get()
     brightness_factor = brightness_slider.get()
     hue_factor = hue_slider.get()
 
     # Apply adjustments and blend the original and transformed LUTs
-    target_lut = adjust_image(target_lut, contrast_factor, brightness_factor, hue_factor)  # Adjust the LUT as required
-
-    # Adjust the LUT by applying the contrast and brightness adjustments
-    adjusted_lut = target_lut[:, [2, 1, 0]]  # Convert from BGR to RGB
+    target_lut = adjust_image(target_lut, saturation_factor, contrast_factor, brightness_factor, hue_factor)  # Adjust the LUT as required
 
     # Blend the original and adjusted LUTs
-    final_lut = blend_images(og_lut, adjusted_lut, strength_slider.get())
+    final_lut = blend_images(og_lut, target_lut, strength_slider.get())
 
     # Reshape the final LUT to be a flat array of RGB values
-    final_lut_flat = final_lut.reshape(-1, 3)  # Ensure it's a flat array where each row is [R, G, B]
+    final_lut_flat = final_lut[:, [0, 1, 2]].reshape(-1, 3)  # Ensure it's a flat array where each row is [R, G, B]
 
     # Save the RGB data as raw bytes (no header)
     if os.path.splitext(filename)[1].lower() == '.cube':
@@ -632,14 +760,15 @@ def apply_transformation(*args):
         last_loaded_lut = current_lut_file_path
 
     # Get the current slider values
+    saturation_factor = saturation_slider.get()
     contrast_factor = contrast_slider.get()
     brightness_factor = brightness_slider.get()
     hue_factor = hue_slider.get()
     strength_factor = strength_slider.get()
 
     # Apply adjustments and blend the original and transformed images
-    if contrast_factor != 0 or brightness_factor != 0 or hue_factor != 0:
-        adjusted_image = adjust_image(transformed_image, contrast_factor, brightness_factor, hue_factor)
+    if saturation_factor != 0 or contrast_factor != 0 or brightness_factor != 0 or hue_factor != 0:
+        adjusted_image = adjust_image(transformed_image, saturation_factor, contrast_factor, brightness_factor, hue_factor)
     else:
         adjusted_image = transformed_image
     
@@ -781,11 +910,12 @@ def on_platform_change(selected_platform):
 
 def reset_sliders():
     # Reset all sliders to their default values
+    saturation_slider.set(0)
     contrast_slider.set(0)  # Default value for contrast
     brightness_slider.set(0)  # Default value for brightness
     hue_slider.set(0)  # Default value for hue
     strength_slider.set(100)  # Default value for effect strength
-    show_image(Image.fromarray(transformed_image))
+    #show_image(Image.fromarray(transformed_image))
     print("Sliders reset to default values.")
 
 
@@ -794,6 +924,13 @@ def update_rgb_label(name):
 
 def update_image_label(name):
     image_label.config(text=name)
+
+def on_mouse_wheel_slider(event, slider):
+    """Handle mouse scroll to adjust slider value."""
+    if event.delta > 0:
+        slider.set(slider.get() + 1)  # Scroll up, increase value
+    elif event.delta < 0:
+        slider.set(slider.get() - 1)
 
 # Global variables
 current_thread = None  # Track the current thread
@@ -886,7 +1023,7 @@ def on_down_arrow(event):
 # GUI components
 def run_app():
     global image, original_image, target_lut, transformed_image, blended_image, z_curve_map, swizzle_map, cube_map
-    global strength_slider, contrast_slider, brightness_slider, hue_slider, debounced_apply_transformation
+    global strength_slider, saturation_slider, contrast_slider, brightness_slider, hue_slider, debounced_apply_transformation
     transformed_image = None
     blended_image = None
     image = None
@@ -965,26 +1102,36 @@ def run_app():
     platform_menu.pack(side='left', padx=5, pady=5)
 
     # Add sliders to control Effect Strength, Contrast, Brightness
+    saturation_slider = Scale(controls_frame, from_=-100, to=100, orient=HORIZONTAL, label="Saturation", length=170)
+    saturation_slider.set(0)
+    saturation_slider.pack(side='right', padx=5, pady=5)
+    saturation_slider.bind("<MouseWheel>", lambda event, slider=saturation_slider: on_mouse_wheel_slider(event, slider))
+
     contrast_slider = Scale(controls_frame, from_=-100, to=100, orient=HORIZONTAL, label="Contrast", length=170)
     contrast_slider.set(0)
     contrast_slider.pack(side='right', padx=5, pady=5)
+    contrast_slider.bind("<MouseWheel>", lambda event, slider=contrast_slider: on_mouse_wheel_slider(event, slider))
 
     brightness_slider = Scale(controls_frame, from_=-100, to=100, orient=HORIZONTAL, label="Brightness", length=170)
     brightness_slider.set(0)
     brightness_slider.pack(side='right', padx=5, pady=5)
+    brightness_slider.bind("<MouseWheel>", lambda event, slider=brightness_slider: on_mouse_wheel_slider(event, slider))
 
     hue_slider = Scale(controls_frame, from_=-100, to=100, orient=HORIZONTAL, label="Hue", length=170)
     hue_slider.set(0)
     hue_slider.pack(side='right', padx=5, pady=5)
+    hue_slider.bind("<MouseWheel>", lambda event, slider=hue_slider: on_mouse_wheel_slider(event, slider))
 
     strength_slider = Scale(controls_frame, from_=0, to=200, orient=HORIZONTAL, label="Effect Strength", length=170)
     strength_slider.set(100)  # Default value to 100 (normal effect)
     strength_slider.pack(side='right', padx=5, pady=5)
+    strength_slider.bind("<MouseWheel>", lambda event, slider=strength_slider: on_mouse_wheel_slider(event, slider))
 
     # Initialize the debounced transformation function
     debounced_apply_transformation = Debouncer(apply_transformation, delay=0.2)  # 200ms debounce
 
     # Bind sliders to update image with debounce
+    saturation_slider.bind("<Motion>", apply_transformation_debounced)
     contrast_slider.bind("<Motion>", apply_transformation_debounced)
     brightness_slider.bind("<Motion>", apply_transformation_debounced)
     hue_slider.bind("<Motion>", apply_transformation_debounced)
