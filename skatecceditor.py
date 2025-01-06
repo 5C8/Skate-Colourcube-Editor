@@ -2,6 +2,7 @@ import numpy as np
 from tkinter import Tk, filedialog, Button, Canvas, Scale, OptionMenu, StringVar, HORIZONTAL, Frame, Label
 from PIL import Image, ImageTk
 import os
+from scipy.ndimage import zoom
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import threading
@@ -223,6 +224,42 @@ def parse_cube_file(file_path):
     
     return size, data_points
 
+def trilinear_interpolate(data, grid_x, grid_y, grid_z, size):
+    grid_x = np.clip(grid_x, 0, size - 2)
+    grid_y = np.clip(grid_y, 0, size - 2)
+    grid_z = np.clip(grid_z, 0, size - 2)
+
+    x0 = np.floor(grid_x).astype(int)
+    y0 = np.floor(grid_y).astype(int)
+    z0 = np.floor(grid_z).astype(int)
+    x1 = x0 + 1
+    y1 = y0 + 1
+    z1 = z0 + 1
+
+    dx = grid_x - x0
+    dy = grid_y - y0
+    dz = grid_z - z0
+
+    c000 = data[x0, y0, z0]
+    c100 = data[x1, y0, z0]
+    c010 = data[x0, y1, z0]
+    c110 = data[x1, y1, z0]
+    c001 = data[x0, y0, z1]
+    c101 = data[x1, y0, z1]
+    c011 = data[x0, y1, z1]
+    c111 = data[x1, y1, z1]
+
+    c00 = c000 * (1 - dx[..., np.newaxis]) + c100 * dx[..., np.newaxis]
+    c10 = c010 * (1 - dx[..., np.newaxis]) + c110 * dx[..., np.newaxis]
+    c01 = c001 * (1 - dx[..., np.newaxis]) + c101 * dx[..., np.newaxis]
+    c11 = c011 * (1 - dx[..., np.newaxis]) + c111 * dx[..., np.newaxis]
+
+    c0 = c00 * (1 - dy[..., np.newaxis]) + c10 * dy[..., np.newaxis]
+    c1 = c01 * (1 - dy[..., np.newaxis]) + c11 * dy[..., np.newaxis]
+
+    result = c0 * (1 - dz[..., np.newaxis]) + c1 * dz[..., np.newaxis]
+
+    return result
 
 def load_cube(file_path):
     global platform
@@ -237,7 +274,7 @@ def load_cube(file_path):
         raise ValueError("LUT size (LUT_3D_SIZE) not found in the .cube file.")
     
     # Convert data points to a NumPy array and scale to [0, 255]
-    data = (np.array(data_points, dtype=np.float32) * 255).astype(np.uint8)
+    data = np.clip(np.array(data_points, dtype=np.float32) * 255, 0, 255).astype(np.uint8)
 
     # Validate the data length
     expected_points = size ** 3
@@ -245,32 +282,26 @@ def load_cube(file_path):
         raise ValueError(f"Expected {expected_points} data points, but got {len(data)}.")
     
     # Resample the data if size is not 32x32x32
-    if size != 32:
+    elif size != 32:
         new_size = 32
-
-        # Reshape the data into a 3D grid (size, size, size, 3)
         data = data.reshape((size, size, size, 3))
 
-        # Use advanced NumPy indexing to create the new grid for resampling
-        # Create indices for the new grid (size 32) and find the corresponding indices in the original grid
-        x = np.linspace(0, size-1, new_size)
-        y = np.linspace(0, size-1, new_size)
-        z = np.linspace(0, size-1, new_size)
-        
-        # Use meshgrid to generate a grid of indices in the original data size
+        x = np.linspace(0, size - 1, new_size)
+        y = np.linspace(0, size - 1, new_size)
+        z = np.linspace(0, size - 1, new_size)
+
         grid_x, grid_y, grid_z = np.meshgrid(x, y, z, indexing='ij')
+        resized_data = trilinear_interpolate(data, grid_x, grid_y, grid_z, size)
 
-        # Interpolate by indexing the data with the corresponding indices in the original LUT
-        resized_data = data[grid_x.astype(int), grid_y.astype(int), grid_z.astype(int)]
+        resized_data = np.clip(resized_data, 0, 255)
+        resized_data = resized_data.astype(np.uint8)
 
-        # Flatten the resized LUT back to a 1D array
         data = resized_data.reshape((new_size ** 3, 3))
 
     # Initialize the destination array
     color_cube = data  # Shape (num_coords, 3), each entry is [R, G, B]
     dest = np.zeros_like(color_cube)
 
-    # Efficient flattening of mapping arrays (no need for additional copies)
     indices_c = cube_map.flatten()
     indices_z = z_curve_map.flatten()
     indices_s = swizzle_map.flatten()
