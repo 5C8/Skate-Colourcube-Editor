@@ -503,66 +503,26 @@ def adjust_saturation_chunk(chunk, saturation_factor):
     if saturation_factor == 0:
         return chunk
 
-    # Normalize the image data to [0, 1]
-    chunk = chunk / 255.0
-    R, G, B = chunk[..., 0], chunk[..., 1], chunk[..., 2]
+    # Convert to grayscale by averaging the RGB channels
+    # Common formula: L = 0.299*R + 0.587*G + 0.114*B
+    gray = 0.299 * chunk[..., 0] + 0.587 * chunk[..., 1] + 0.114 * chunk[..., 2]
+    
+    # Expand the gray values back to three channels
+    gray_chunk = np.stack([gray, gray, gray], axis=-1)
 
-    # Calculate max, min, delta, and lightness
-    max_val = np.max(chunk, axis=-1)
-    min_val = np.min(chunk, axis=-1)
-    delta = max_val - min_val
-    L = (max_val + min_val) / 2
-
-    # Adjust saturation using a vectorized approach
-    epsilon = 1e-10
-    S = np.where(L < 0.5, delta / (max_val + min_val + epsilon), delta / (2 - max_val - min_val + epsilon))
-    S = np.nan_to_num(S)  # Avoid NaNs from division by zero
-    S = np.clip(S * (saturation_factor / 100 + 1), 0, 1)
-
-    # Precompute constants
-    one_sixth = 1 / 6
-    two_thirds = 2 / 3
-
-    # Calculate Q and P for hue adjustment
-    Q = np.where(L < 0.5, L * (1 + S), L + S - L * S)
-    P = 2 * L - Q
-
-    # Vectorized hue calculations
-    H = np.zeros_like(R)
-    idx = delta > 0
-    delta = np.where(delta == 0, epsilon, delta)  # Avoid division by zero in hue calculation
-    H[idx & (max_val == R)] = (G - B)[idx & (max_val == R)] / delta[idx & (max_val == R)]
-    H[idx & (max_val == G)] = 2 + (B - R)[idx & (max_val == G)] / delta[idx & (max_val == G)]
-    H[idx & (max_val == B)] = 4 + (R - G)[idx & (max_val == B)] / delta[idx & (max_val == B)]
-    H /= 6
-    H = np.where(H < 0, H + 1, H)
-
-    # Vectorized _hue_to_rgb function
-    def _hue_to_rgb(p, q, t):
-        t = np.where(t < 0, t + 1, t)
-        t = np.where(t > 1, t - 1, t)
-        return np.where(t < one_sixth, p + (q - p) * 6 * t,
-               np.where(t < 0.5, q, 
-               np.where(t < two_thirds, p + (q - p) * (two_thirds - t) * 6, p)))
-
-    R = _hue_to_rgb(P, Q, H + one_sixth)
-    G = _hue_to_rgb(P, Q, H)
-    B = _hue_to_rgb(P, Q, H - one_sixth)
-
-    # Reconstruct and scale the image back to [0, 255]
-    chunk = np.stack([R, G, B], axis=-1) * 255
-    return np.clip(chunk, 0, 255).astype(np.uint8)
+    # Scale back to [0, 255]
+    return np.clip(gray_chunk, 0, 255).astype(np.uint8)
 
 def adjust_saturation(image_data, saturation_factor, num_workers=12):
     height = image_data.shape[0]
-    
+
     # Calculate the chunk size and the remainder
     chunk_size = height // num_workers
     remainder = height % num_workers
 
     # Slice image_data into chunks, with the last chunk taking the remainder
     chunks = [image_data[i * chunk_size:(i + 1) * chunk_size] for i in range(num_workers)]
-    
+
     # Handle the remainder by adding it to the last chunk
     if remainder > 0:
         chunks[-1] = np.vstack([chunks[-1], image_data[-remainder:]])
@@ -573,7 +533,19 @@ def adjust_saturation(image_data, saturation_factor, num_workers=12):
 
     return np.vstack(processed_chunks)
 
-saturated_image = None
+def apply_contrast(image_data, contrast_factor):
+    # Convert image to float32 for precision during manipulation
+    image_data = image_data.astype(np.float32)
+
+    # Compute the mean pixel value for each channel
+    mean = np.mean(image_data, axis=(0, 1), keepdims=True)
+
+    # Apply the contrast adjustment
+    image_data = (image_data - mean) * (contrast_factor / 100 + 1) + mean
+
+    # Clip the values to ensure they remain within [0, 255]
+    return np.clip(image_data, 0, 255).astype(np.uint8)
+
 desaturated_image = None
 previous_image_hash = None
 
@@ -581,31 +553,32 @@ def hash_image(image_data):
     """Generate a hash for the given image data."""
     return hashlib.sha256(image_data.tobytes()).hexdigest()
 
-def adjust_image(image_data, saturation_factor, contrast_factor, brightness_factor, hue_factor):
-    global saturated_image, desaturated_image, previous_image_hash
-    
+def adjust_image(image_data):
+    global desaturated_image, previous_image_hash
+
     current_image_hash = hash_image(image_data)
-    if previous_image_hash != current_image_hash:
+    if previous_image_hash != current_image_hash and saturation_slider.get() != 0:
         # Image data has changed, recalculate saturated and desaturated images
-        saturated_image = adjust_saturation(image_data, 200)
         desaturated_image = adjust_saturation(image_data, -100)
         previous_image_hash = current_image_hash
 
-    if saturation_factor != 0:
-        if saturation_factor > 0:
-            image_data = blend_images(image_data, saturated_image, saturation_factor)
-        else:
-            image_data = blend_images(image_data, desaturated_image, -saturation_factor)
+    if saturation_slider.get() != 0:
+        image_data = blend_images(image_data, desaturated_image, -saturation_slider.get())
 
     # Apply contrast adjustment
-    mean = np.mean(image_data, axis=(0, 1), keepdims=True)
-    image_data = (image_data - mean) * (contrast_factor / 100 + 1) + mean
+    if contrast_slider.get() != 0:
+        mean = np.mean(image_data, axis=(0, 1), keepdims=True)
+        image_data = (image_data - mean) * (contrast_slider.get() / 100 + 1) + mean
 
     # Apply brightness adjustment
-    image_data += brightness_factor
+    brightness_adjustment = brightness_slider.get()
+    if brightness_adjustment != 0:
+        # Normalize the adjustment to a meaningful range (e.g., -128 to +128 for full range adjustment)
+        brightness_adjustment = brightness_adjustment/100 * 128
+        image_data = np.clip(image_data + brightness_adjustment, 0, 255)
 
     # Apply hue adjustment
-    hue_angle = hue_factor * (np.pi / 180)
+    hue_angle = hue_slider.get() * (np.pi / 180)
     cos_hue = np.cos(hue_angle)
     sin_hue = np.sin(hue_angle)
     rotation_matrix = np.array([
@@ -627,18 +600,9 @@ def save_image():
     if not save_path:
         return
 
-    # Get the current slider values
-    saturation_factor = saturation_slider.get()
-    contrast_factor = contrast_slider.get()
-    brightness_factor = brightness_slider.get()
-    hue_factor = hue_slider.get()
-    strength_factor = strength_slider.get()
-
     # Apply adjustments and blend the original and transformed images
-    if saturation_factor != 0 or contrast_factor != 0 or brightness_factor != 0 or hue_factor != 0:
-        adjusted_image = adjust_image(transformed_image, saturation_factor, contrast_factor, brightness_factor, hue_factor)
-    else:
-        adjusted_image = transformed_image
+    adjusted_image = adjust_image(transformed_image)
+    strength_factor = strength_slider.get()
     
     if strength_factor != 100:
         final_image = blend_images(original_image, adjusted_image, strength_factor)
@@ -708,14 +672,8 @@ def save_rgb():
     if not filename:
         return
 
-    # Get the current slider values
-    saturation_factor = saturation_slider.get()
-    contrast_factor = contrast_slider.get()
-    brightness_factor = brightness_slider.get()
-    hue_factor = hue_slider.get()
-
     # Apply adjustments and blend the original and transformed LUTs
-    target_lut = adjust_image(target_lut, saturation_factor, contrast_factor, brightness_factor, hue_factor)  # Adjust the LUT as required
+    target_lut = adjust_image(target_lut)  # Adjust the LUT as required
 
     # Blend the original and adjusted LUTs
     final_lut = blend_images(og_lut, target_lut, strength_slider.get())
@@ -759,25 +717,15 @@ def apply_transformation(*args):
             transformed_image = map_image_to_color_cube(original_image, target_lut, 32, platform, z_curve_map, swizzle_map)
         last_loaded_lut = current_lut_file_path
 
-    # Get the current slider values
-    saturation_factor = saturation_slider.get()
-    contrast_factor = contrast_slider.get()
-    brightness_factor = brightness_slider.get()
-    hue_factor = hue_slider.get()
+
+    adjusted_image = adjust_image(transformed_image)  
     strength_factor = strength_slider.get()
 
-    # Apply adjustments and blend the original and transformed images
-    if saturation_factor != 0 or contrast_factor != 0 or brightness_factor != 0 or hue_factor != 0:
-        adjusted_image = adjust_image(transformed_image, saturation_factor, contrast_factor, brightness_factor, hue_factor)
-    else:
-        adjusted_image = transformed_image
-    
     if strength_factor != 100:
         blended_image = blend_images(original_image, adjusted_image, strength_factor)
     else:
         blended_image = adjusted_image
 
-    # Update the displayed image
     show_image(Image.fromarray(blended_image))
 
 def load_image(file_path):
@@ -909,14 +857,15 @@ def on_platform_change(selected_platform):
     print(f"Platform switched to: {selected_platform}")
 
 def reset_sliders():
-    # Reset all sliders to their default values
+    global blended_image, transformed_image
     saturation_slider.set(0)
-    contrast_slider.set(0)  # Default value for contrast
-    brightness_slider.set(0)  # Default value for brightness
-    hue_slider.set(0)  # Default value for hue
-    strength_slider.set(100)  # Default value for effect strength
-    #show_image(Image.fromarray(transformed_image))
+    contrast_slider.set(0)
+    brightness_slider.set(0)
+    hue_slider.set(0)
+    strength_slider.set(100)
+    blended_image = transformed_image
     print("Sliders reset to default values.")
+    apply_transformation_debounced()
 
 
 def update_rgb_label(name):
@@ -1102,27 +1051,27 @@ def run_app():
     platform_menu.pack(side='left', padx=5, pady=5)
 
     # Add sliders to control Effect Strength, Contrast, Brightness
-    saturation_slider = Scale(controls_frame, from_=-100, to=100, orient=HORIZONTAL, label="Saturation", length=170)
+    saturation_slider = Scale(controls_frame, from_=-100, to=100, orient=HORIZONTAL, label="Saturation")
     saturation_slider.set(0)
     saturation_slider.pack(side='right', padx=5, pady=5)
     saturation_slider.bind("<MouseWheel>", lambda event, slider=saturation_slider: on_mouse_wheel_slider(event, slider))
 
-    contrast_slider = Scale(controls_frame, from_=-100, to=100, orient=HORIZONTAL, label="Contrast", length=170)
+    contrast_slider = Scale(controls_frame, from_=-100, to=100, orient=HORIZONTAL, label="Contrast")
     contrast_slider.set(0)
     contrast_slider.pack(side='right', padx=5, pady=5)
     contrast_slider.bind("<MouseWheel>", lambda event, slider=contrast_slider: on_mouse_wheel_slider(event, slider))
 
-    brightness_slider = Scale(controls_frame, from_=-100, to=100, orient=HORIZONTAL, label="Brightness", length=170)
+    brightness_slider = Scale(controls_frame, from_=-100, to=100, orient=HORIZONTAL, label="Brightness")
     brightness_slider.set(0)
     brightness_slider.pack(side='right', padx=5, pady=5)
     brightness_slider.bind("<MouseWheel>", lambda event, slider=brightness_slider: on_mouse_wheel_slider(event, slider))
 
-    hue_slider = Scale(controls_frame, from_=-100, to=100, orient=HORIZONTAL, label="Hue", length=170)
+    hue_slider = Scale(controls_frame, from_=-100, to=100, orient=HORIZONTAL, label="Hue")
     hue_slider.set(0)
     hue_slider.pack(side='right', padx=5, pady=5)
     hue_slider.bind("<MouseWheel>", lambda event, slider=hue_slider: on_mouse_wheel_slider(event, slider))
 
-    strength_slider = Scale(controls_frame, from_=0, to=200, orient=HORIZONTAL, label="Effect Strength", length=170)
+    strength_slider = Scale(controls_frame, from_=0, to=200, orient=HORIZONTAL, label="Effect Strength")
     strength_slider.set(100)  # Default value to 100 (normal effect)
     strength_slider.pack(side='right', padx=5, pady=5)
     strength_slider.bind("<MouseWheel>", lambda event, slider=strength_slider: on_mouse_wheel_slider(event, slider))
