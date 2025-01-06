@@ -2,7 +2,6 @@ import numpy as np
 from tkinter import Tk, filedialog, Button, Canvas, Scale, OptionMenu, StringVar, HORIZONTAL, Frame, Label
 from PIL import Image, ImageTk
 import os
-from scipy.ndimage import zoom
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import threading
@@ -282,7 +281,7 @@ def load_cube(file_path):
         raise ValueError(f"Expected {expected_points} data points, but got {len(data)}.")
     
     # Resample the data if size is not 32x32x32
-    elif size != 32:
+    if size != 32:
         new_size = 32
         data = data.reshape((size, size, size, 3))
 
