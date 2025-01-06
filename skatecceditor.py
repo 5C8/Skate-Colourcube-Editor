@@ -673,10 +673,10 @@ def save_rgb():
         return
 
     # Apply adjustments and blend the original and transformed LUTs
-    target_lut = adjust_image(target_lut)  # Adjust the LUT as required
+    adjusted_lut = adjust_image(target_lut)  # Adjust the LUT as required
 
     # Blend the original and adjusted LUTs
-    final_lut = blend_images(og_lut, target_lut, strength_slider.get())
+    final_lut = blend_images(og_lut, adjusted_lut, strength_slider.get())
 
     # Reshape the final LUT to be a flat array of RGB values
     final_lut_flat = final_lut[:, [0, 1, 2]].reshape(-1, 3)  # Ensure it's a flat array where each row is [R, G, B]
